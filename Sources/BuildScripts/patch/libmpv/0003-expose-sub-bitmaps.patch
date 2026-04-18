@@ -1,0 +1,150 @@
+diff --git forkSrcPrefix/include/mpv/client.h forkDstPrefix/include/mpv/client.h
+index 85cff63..ce66dfa 100644
+--- forkSrcPrefix/include/mpv/client.h
++++ forkDstPrefix/include/mpv/client.h
+@@ -1368,6 +1368,18 @@ typedef enum mpv_event_id {
+      * See also mpv_event and mpv_event_hook.
+      */
+     MPV_EVENT_HOOK              = 25,
++    /**
++     * A bitmap subtitle (PGS, VobSub, DVB, …) was decoded by sd_lavc.
++     * The event data is a mpv_event_sub_bitmap, valid only until the event
++     * is consumed (mpv_wait_event returns the next event).
++     *
++     * One event is fired per sub-rect in the decoded subtitle event, in BGRA
++     * (premultiplied alpha). Use `pts` and `duration` to schedule display.
++     *
++     * Added by the MPVKit fork to enable native bitmap-subtitle OCR without
++     * re-demuxing the file via ffmpeg or screenshot diffs.
++     */
++    MPV_EVENT_SUB_BITMAP        = 26,
+     // Internal note: adjust INTERNAL_EVENT_BASE when adding new events.
+ } mpv_event_id;
+ 
+@@ -1567,6 +1579,30 @@ typedef struct mpv_event_hook {
+     uint64_t id;
+ } mpv_event_hook;
+ 
++/**
++ * Data for MPV_EVENT_SUB_BITMAP. (MPVKit fork extension.)
++ *
++ * Fired once per sub-rect decoded by sd_lavc for bitmap subtitle codecs
++ * (PGS / VobSub / DVB / xsub). Bitmap is BGRA, alpha-premultiplied (libavcodec
++ * convention after palette expansion).
++ *
++ * The bitmap pointer and the struct itself are owned by the event queue and
++ * freed when the event is consumed — copy out of `bgra` before processing on
++ * another thread.
++ */
++typedef struct mpv_event_sub_bitmap {
++    double pts;        // presentation time in seconds (matches video time-pos)
++    double duration;   // 0 if unknown (no end PTS in source)
++    int width;         // bitmap width in pixels
++    int height;        // bitmap height in pixels
++    int stride;        // bytes per row of `bgra`
++    int x;             // x offset on the source video frame
++    int y;             // y offset on the source video frame
++    int video_w;       // source video width (for positioning context)
++    int video_h;       // source video height
++    void *bgra;        // BGRA8 pixel buffer, premultiplied alpha
++} mpv_event_sub_bitmap;
++
+ // Since API version 1.102.
+ typedef struct mpv_event_command {
+     /**
+diff --git forkSrcPrefix/player/client.c forkDstPrefix/player/client.c
+index e23b98b..c4eb377 100644
+--- forkSrcPrefix/player/client.c
++++ forkDstPrefix/player/client.c
+@@ -689,6 +689,18 @@ static void dup_event_data(struct mpv_event *ev)
+     case MPV_EVENT_END_FILE:
+         ev->data = talloc_memdup(NULL, ev->data, sizeof(mpv_event_end_file));
+         break;
++    case MPV_EVENT_SUB_BITMAP: {
++        mpv_event_sub_bitmap *src = ev->data;
++        mpv_event_sub_bitmap *dst = talloc_memdup(NULL, src, sizeof(*src));
++        if (src->bgra && src->stride > 0 && src->height > 0) {
++            dst->bgra = talloc_memdup(dst, src->bgra,
++                                      (size_t)src->stride * src->height);
++        } else {
++            dst->bgra = NULL;
++        }
++        ev->data = dst;
++        break;
++    }
+     default:
+         // Doesn't use events with memory allocation.
+         if (ev->data)
+@@ -2114,6 +2126,7 @@ static const char *const event_table[] = {
+     [MPV_EVENT_PROPERTY_CHANGE] = "property-change",
+     [MPV_EVENT_QUEUE_OVERFLOW] = "event-queue-overflow",
+     [MPV_EVENT_HOOK] = "hook",
++    [MPV_EVENT_SUB_BITMAP] = "sub-bitmap",
+ };
+ 
+ const char *mpv_event_name(mpv_event_id event)
+diff --git forkSrcPrefix/player/command.h forkDstPrefix/player/command.h
+index d118382..2573ef7 100644
+--- forkSrcPrefix/player/command.h
++++ forkDstPrefix/player/command.h
+@@ -100,7 +100,7 @@ uint64_t mp_get_property_event_mask(const char *name);
+ enum {
+     // Must start with the first unused positive value in enum mpv_event_id
+     // MPV_EVENT_* and MP_EVENT_* must not overlap.
+-    INTERNAL_EVENT_BASE = 26,
++    INTERNAL_EVENT_BASE = 27,
+     MP_EVENT_CHANGE_ALL,
+     MP_EVENT_CACHE_UPDATE,
+     MP_EVENT_WIN_RESIZE,
+diff --git forkSrcPrefix/sub/sd_lavc.c forkDstPrefix/sub/sd_lavc.c
+index 5cbc6d0..11fffa3 100644
+--- forkSrcPrefix/sub/sd_lavc.c
++++ forkDstPrefix/sub/sd_lavc.c
+@@ -27,11 +27,14 @@
+ #include "mpv_talloc.h"
+ #include "common/msg.h"
+ #include "common/av_common.h"
++#include "common/global.h"
+ #include "demux/stheader.h"
+ #include "options/options.h"
++#include "player/client.h"
+ #include "video/mp_image.h"
+ #include "video/out/bitmap_packer.h"
+ #include "img_convert.h"
++#include "libmpv/client.h"
+ #include "sd.h"
+ #include "dec_sub.h"
+ 
+@@ -402,6 +405,32 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+ 
+     read_sub_bitmaps(sd, current);
+ 
++    // MPVKit fork: broadcast each decoded sub-rect to API clients so they can
++    // OCR / overlay the bitmap themselves. Skipped if no rects survived
++    // read_sub_bitmaps (e.g. forced-only filter dropped everything).
++    if (current->count > 0 && sd->global && sd->global->client_api) {
++        double evt_dur = (current->endpts > current->pts &&
++                          current->endpts != MP_NOPTS_VALUE)
++                         ? (current->endpts - current->pts) : 0.0;
++        for (int i = 0; i < current->count; i++) {
++            struct sub_bitmap *b = &current->inbitmaps[i];
++            mpv_event_sub_bitmap evd = {
++                .pts      = current->pts,
++                .duration = evt_dur,
++                .width    = b->w,
++                .height   = b->h,
++                .stride   = b->stride,
++                .x        = b->x,
++                .y        = b->y,
++                .video_w  = current->src_w,
++                .video_h  = current->src_h,
++                .bgra     = b->bitmap,
++            };
++            mp_client_broadcast_event_external(sd->global->client_api,
++                                               MPV_EVENT_SUB_BITMAP, &evd);
++        }
++    }
++
+     if (pts != MP_NOPTS_VALUE) {
+         for (int n = 0; n < priv->num_seekpoints; n++) {
+             if (priv->seekpoints[n].pts == pts)
